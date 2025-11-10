@@ -1,0 +1,566 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <title>PyTorch ONNX 核心转换流程与API详解</title>
+    <style>
+        body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Arial, sans-serif; line-height: 1.8; margin: 0; padding: 20px; max-width: 1400px; margin: 0 auto; color: #333; }
+        h1 { text-align: center; color: #2d3748; border-bottom: 3px solid #4299e1; padding-bottom: 12px; margin-bottom: 40px; }
+        h2 { color: #2b6cb0; margin-top: 40px; margin-bottom: 20px; padding-left: 10px; border-left: 4px solid #4299e1; }
+        h3 { color: #2c5282; margin-top: 18px; margin-bottom: 12px; }
+        .toc { background-color: #f7fafc; padding: 25px; border-radius: 10px; margin-bottom: 40px; box-shadow: 0 1px 3px rgba(0,0,0,0.1); }
+        .toc h2 { margin-top: 0; color: #2d3748; border-left: none; padding-left: 0; }
+        .toc ul { list-style-type: none; padding: 0; margin: 0; }
+        .toc li { margin: 10px 0; position: relative; padding-left: 20px; }
+        .toc li:before { content: "•"; color: #4299e1; font-weight: bold; position: absolute; left: 0; }
+        .toc a { text-decoration: none; color: #4299e1; font-size: 16px; transition: color 0.3s; }
+        .toc a:hover { text-decoration: underline; color: #2b6cb0; }
+        /* 代码块样式 - 符合Python规范 */
+        .code-block { 
+            background-color: #f8f8f8; 
+            padding: 20px; 
+            border-radius: 8px; 
+            overflow-x: auto; 
+            font-family: "Consolas", "Monaco", "Menlo", monospace; 
+            margin: 15px 0; 
+            font-size: 14px; 
+            line-height: 1.6;
+            border: 1px solid #e2e8f0;
+        }
+        .code-keyword { color: #0033b3; font-weight: bold; }
+        .code-string { color: #7d5bbf; }
+        .code-comment { color: #008000; }
+        .code-function { color: #795e26; }
+        .code-parameter { color: #cd3131; }
+        .section { margin-bottom: 50px; padding-bottom: 25px; border-bottom: 1px solid #e2e8f0; }
+        .section:last-child { border-bottom: none; margin-bottom: 30px; }
+        .question { font-weight: 600; color: #2d3748; margin-bottom: 15px; display: block; font-size: 17px; }
+        ul { margin: 10px 0; padding-left: 25px; }
+        li { margin: 8px 0; }
+    </style>
+</head>
+<body>
+    <h1>第二部分：核心转换流程与API详解 (16-30)</h1>
+
+    <!-- 目录 -->
+    <div class="toc">
+        <h2>目录</h2>
+        <ul>
+            <li><a href="#16">16. torch.onnx.export 函数核心调用代码框架</a></li>
+            <li><a href="#17">17. export 函数中 model、args、f 三个参数的必要性</a></li>
+            <li><a href="#18">18. input_names 和 output_names 参数的作用</a></li>
+            <li><a href="#19">19. 导出前执行 model.eval() 的原因及后果</a></li>
+            <li><a href="#20">20. args 参数使用随机张量可能掩盖的问题</a></li>
+            <li><a href="#21">21. 使用真实样本/代表性哑数据作为输入的好处</a></li>
+            <li><a href="#22">22. 多GPU模型（DataParallel/DDP）的ONNX导出方法</a></li>
+            <li><a href="#23">23. 导出并保存模型中间层输出的方法及调试用途</a></li>
+            <li><a href="#24">24. ONNX导出使用的JIT模式及根本限制</a></li>
+            <li><a href="#25">25. 常量折叠的定义、PyTorch支持情况及影响</a></li>
+            <li><a href="#26">26. 导出大模型中某部分子图的方法</a></li>
+            <li><a href="#27">27. 图像预处理/后处理集成到ONNX模型的利弊</a></li>
+            <li><a href="#28">28. 导出阶段剪枝模型不需要的输出</a></li>
+            <li><a href="#29">29. 编写部署友好型PyTorch模型的编程习惯</a></li>
+            <li><a href="#30">30. 管理PyTorch、ONNX、推理引擎的版本兼容性</a></li>
+        </ul>
+    </div>
+
+    <!-- 16. 核心调用代码框架 -->
+    <div class="section" id="16">
+        <h2>16. torch.onnx.export 函数核心调用代码框架</h2>
+        <p class="question">torch.onnx.export 函数最核心的调用代码框架如下：</p>
+        <div class="code-block">
+<span class="code-keyword">import</span> torch<br>
+<span class="code-keyword">import</span> onnx<br>
+<br>
+<span class="code-comment"># 加载预训练模型</span><br>
+model = torch.hub.load(<span class="code-string">'pytorch/vision'</span>, <span class="code-string">'resnet18'</span>, pretrained=<span class="code-keyword">True</span>)<br>
+model.eval()  <span class="code-comment"># 关键！确保模型处于评估模式</span><br>
+<br>
+<span class="code-comment"># 准备输入数据</span><br>
+input_names = [<span class="code-string">'input'</span>]  <span class="code-comment"># 模型输入名称</span><br>
+output_names = [<span class="code-string">'output'</span>]  <span class="code-comment"># 模型输出名称</span><br>
+batch_size = 1<br>
+input_data = torch.randn(batch_size, 3, 224, 224)  <span class="code-comment"># 示例输入张量</span><br>
+<br>
+<span class="code-comment"># 导出ONNX模型</span><br>
+torch.onnx.export(<br>
+    model,  <span class="code-comment"># 要导出的模型</span><br>
+    input_data,  <span class="code-comment"># 示例输入张量</span><br>
+    <span class="code-string">"model.onnx"</span>,  <span class="code-comment"># 输出文件路径</span><br>
+    opset_version=13,  <span class="code-comment"># 指定ONNX算子集版本</span><br>
+    do_constant_folding=<span class="code-keyword">True</span>,  <span class="code-comment"># 启用常量折叠</span><br>
+    input_names=input_names,  <span class="code-comment"># 指定输入名称</span><br>
+    output_names=output_names,  <span class="code-comment"># 指定输出名称</span><br>
+    dynamic_axes={<br>
+        <span class="code-string">'input'</span>: {0: <span class="code-string">'batch_size'</span>},  <span class="code-comment"># 支持动态Batch</span><br>
+        <span class="code-string">'output'</span>: {0: <span class="code-string">'batch_size'</span>}<br>
+    }  <span class="code-comment"># 可选：配置动态维度</span><br>
+)<br>
+<br>
+<span class="code-comment"># 验证导出的ONNX模型</span><br>
+model_onnx = onnx.load(<span class="code-string">"model.onnx"</span>)<br>
+onnx.checker.check_model(model_onnx)  <span class="code-comment"># 检查模型合法性</span>
+        </div>
+    </div>
+
+    <!-- 17. 核心参数必要性 -->
+    <div class="section" id="17">
+        <h2>17. export 函数中 model、args、f 三个参数的必要性</h2>
+        <p>这三个参数是 torch.onnx.export 函数的核心必需参数：</p>
+        <ul>
+            <li><span class="code-parameter">model</span>：要导出的PyTorch模型实例，必须处于评估模式（model.eval()）</li>
+            <li><span class="code-parameter">args</span>：输入模型的示例张量，用于追踪模型执行路径并确定输入形状</li>
+            <li><span class="code-parameter">f</span>：输出文件路径或文件对象，指定导出的ONNX模型保存位置</li>
+        </ul>
+        <p>其中，args参数尤为重要：</p>
+        <ul>
+            <li>它决定了模型计算图的结构，不同输入可能导致不同的计算路径</li>
+            <li>必须与实际推理时的输入类型、形状一致</li>
+            <li>对于包含控制流的模型，输入需覆盖所有可能的分支路径</li>
+        </ul>
+    </div>
+
+    <!-- 18. input_names 和 output_names 作用 -->
+    <div class="section" id="18">
+        <h2>18. input_names 和 output_names 参数的作用</h2>
+        <p class="question">input_names 和 output_names 参数的作用是什么？它们是否只是起一个“好读”的名字？</p>
+        <p>input_names 和 output_names 参数的作用远不止于提供可读名称：</p>
+        <ul>
+            <li>定义输入输出接口：明确指定模型的输入和输出张量名称</li>
+            <li>兼容性保障：确保推理引擎能正确识别模型的输入输出接口</li>
+            <li>调试辅助：在模型检查和可视化工具中使用有意义的名称</li>
+            <li>多输入/输出支持：对于有多个输入或输出的模型，必须明确指定每个张量的名称</li>
+        </ul>
+        <p>关键点：</p>
+        <ul>
+            <li>如果不指定 input_names 和 output_names，导出的模型将使用默认名称（如"input_0"）</li>
+            <li>这些名称必须与推理代码中使用的名称一致，否则会引发错误</li>
+            <li>对于复杂模型（如多输入/输出），明确命名有助于后续部署和调试</li>
+        </ul>
+    </div>
+
+    <!-- 19. model.eval() 的必要性 -->
+    <div class="section" id="19">
+        <h2>19. 导出前执行 model.eval() 的原因及后果</h2>
+        <p class="question">在调用 export 前，为什么必须执行 model.eval()？不这么做会导致什么后果？</p>
+        <p>必须执行 model.eval() 的原因是禁用训练模式下的随机性操作：</p>
+        <ul>
+            <li>在训练模式下，Dropout层会随机丢弃神经元</li>
+            <li>批归一化（BatchNorm）层会使用运行时统计量（均值、方差）</li>
+            <li>其他层（如某些正则化层）也可能在训练和评估模式下行为不同</li>
+        </ul>
+        <p>不执行的后果：</p>
+        <ul>
+            <li>导出的模型将包含训练模式下的随机性操作</li>
+            <li>推理时结果不稳定，每次输入相同数据可能得到不同输出</li>
+            <li>模型参数可能未固定，影响部署性能和准确性</li>
+        </ul>
+        <p>正确做法：</p>
+        <div class="code-block">
+model.eval()  <span class="code-comment"># 关键！禁用训练模式下的随机性</span><br>
+<span class="code-comment"># 可选：禁用梯度计算</span><br>
+<span class="code-keyword">with</span> torch.no_grad():<br>
+    torch.onnx.export(model, input_data, <span class="code-string">"model.onnx"</span>, opset_version=13)
+        </div>
+    </div>
+
+    <!-- 20. 随机张量的问题 -->
+    <div class="section" id="20">
+        <h2>20. args 参数使用随机张量可能掩盖的问题</h2>
+        <p class="question">args 参数如果使用随机张量，可能会掩盖什么问题？</p>
+        <ul>
+            <li>输入形状不匹配：实际推理数据可能有不同形状，而随机张量可能未覆盖所有可能形状</li>
+            <li>边界条件问题：如极小值、极大值、特殊数值（如0、1）可能导致模型行为异常</li>
+            <li>数据类型问题：实际数据可能有不同数据类型（如int8、fp16），而随机张量通常为fp32</li>
+            <li>控制流路径不完整：随机输入可能未触发所有分支路径，导致导出的计算图不完整</li>
+            <li>模型状态依赖：某些模型可能依赖特定输入数据初始化内部状态</li>
+        </ul>
+        <p>最佳实践：</p>
+        <ul>
+            <li>使用真实样本或具有代表性的哑数据作为输入</li>
+            <li>覆盖所有可能的输入形状和数据类型</li>
+            <li>对于包含控制流的模型，确保输入覆盖所有分支路径</li>
+        </ul>
+    </div>
+
+    <!-- 21. 真实样本的好处 -->
+    <div class="section" id="21">
+        <h2>21. 使用真实样本/代表性哑数据作为输入的好处</h2>
+        <p class="question">使用真实样本或更具代表性的“哑数据”作为输入有什么好处？</p>
+        <ul>
+            <li>确保计算图完整性：覆盖所有可能的分支路径和操作</li>
+            <li>验证输入输出一致性：确保导出的模型与原始模型在输入输出上一致</li>
+            <li>暴露潜在问题：如输入形状不匹配、数据类型冲突、控制流错误等</li>
+            <li>支持动态维度：通过具有代表性的输入，可以更准确地推断动态维度</li>
+            <li>提高模型可靠性：确保模型在实际部署环境中能正确运行</li>
+        </ul>
+        <p>典型场景：</p>
+        <ul>
+            <li>对于图像分类模型，使用实际图像尺寸的哑数据</li>
+            <li>对于NLP模型，使用包含各种特殊字符的文本</li>
+            <li>对于时间序列模型，使用不同长度的序列</li>
+        </ul>
+    </div>
+
+    <!-- 22. 多GPU模型导出 -->
+    <div class="section" id="22">
+        <h2>22. 多GPU模型（DataParallel/DDP）的ONNX导出方法</h2>
+        <p class="question">当你的模型分布在多个GPU上（DataParallel/DistributedDataParallel）时，如何正确导出ONNX？</p>
+        <p>正确导出多GPU模型的步骤如下：</p>
+        <div class="code-block">
+<span class="code-keyword">import</span> torch<br>
+<span class="code-keyword">import</span> torch.nn <span class="code-keyword">as</span> nn<br>
+<span class="code-keyword">import</span> onnx<br>
+<br>
+<span class="code-comment"># 对于DataParallel模型</span><br>
+model = nn.DataParallel(model)  <span class="code-comment"># 多GPU训练</span><br>
+model.eval()  <span class="code-comment"># 关键！确保模型处于评估模式</span><br>
+<br>
+<span class="code-comment"># 导出前必须移除DataParallel封装</span><br>
+model = model.module  <span class="code-comment"># 关键！获取原始模型</span><br>
+<br>
+<span class="code-comment"># 准备输入数据</span><br>
+input_data = torch.randn(1, 3, 224, 224).to(<span class="code-string">'cuda'</span>)  <span class="code-comment"># GPU输入</span><br>
+<br>
+<span class="code-comment"># 导出ONNX模型</span><br>
+torch.onnx.export(<br>
+    model,  <span class="code-comment"># 使用原始模型</span><br>
+    input_data,  <span class="code-comment"># GPU输入</span><br>
+    <span class="code-string">"model.onnx"</span>,<br>
+    opset_version=13,<br>
+    do_constant_folding=<span class="code-keyword">True</span>,<br>
+    input_names=[<span class="code-string">'input'</span>],<br>
+    output_names=[<span class="code-string">'output'</span>],<br>
+    dynamic_axes={<span class="code-string">'input'</span>: {0: <span class="code-string">'batch_size'</span>}, <span class="code-string">'output'</span>: {0: <span class="code-string">'batch_size'</span>}},<br>
+    export_params=<span class="code-keyword">True</span>  <span class="code-comment"># 关键！导出模型参数</span><br>
+)
+        </div>
+        <p>关键点：</p>
+        <ul>
+            <li>必须移除DataParallel或DistributedDataParallel封装</li>
+            <li>确保输入数据与实际推理时的输入一致</li>
+            <li>使用 export_params=True 确保模型参数被导出</li>
+            <li>对于DistributedDataParallel模型，需先调用 model = model.module</li>
+        </ul>
+    </div>
+
+    <!-- 23. 中间层输出导出 -->
+    <div class="section" id="23">
+        <h2>23. 导出并保存模型中间层输出的方法及调试用途</h2>
+        <p class="question">如何导出并保存模型中间某层的输出？这在调试中有什么用？</p>
+        <p>导出中间层输出的方法：</p>
+        <div class="code-block">
+<span class="code-keyword">import</span> torch<br>
+<span class="code-keyword">from</span> torch.onnx <span class="code-keyword">import</span> symbolic_registry<br>
+<br>
+<span class="code-comment"># 定义钩子函数</span><br>
+<span class="code-keyword">def</span> <span class="code-function">hook_fn</span>(module, input, output):<br>
+    <span class="code-keyword">global</span> intermediate_output<br>
+    intermediate_output = output<br>
+<br>
+<span class="code-comment"># 注册钩子</span><br>
+hook = model.layer3.register_forward_hook(hook_fn)  <span class="code-comment"># 指定要导出的中间层</span><br>
+<br>
+<span class="code-comment"># 导出模型</span><br>
+<span class="code-keyword">with</span> torch.no_grad():<br>
+    torch.onnx.export(<br>
+        model,<br>
+        input_data,<br>
+        <span class="code-string">"model_with_intermediate.onnx"</span>,<br>
+        opset_version=13,<br>
+        do_constant_folding=<span class="code-keyword">True</span>,<br>
+        input_names=[<span class="code-string">'input'</span>],<br>
+        output_names=[<span class="code-string">'output'</span>, <span class="code-string">'intermediate_output'</span>],  <span class="code-comment"># 添加中间层输出名称</span><br>
+        dynamic_axes={<br>
+            <span class="code-string">'input'</span>: {0: <span class="code-string">'batch_size'</span>},<br>
+            <span class="code-string">'output'</span>: {0: <span class="code-string">'batch_size'</span>},<br>
+            <span class="code-string">'intermediate_output'</span>: {0: <span class="code-string">'batch_size'</span>}<br>
+        },<br>
+        export_params=<span class="code-keyword">True</span><br>
+    )<br>
+<br>
+<span class="code-comment"># 移除钩子</span><br>
+hook.remove()
+        </div>
+        <p>调试用途：</p>
+        <ul>
+            <li>验证中间层输出是否符合预期</li>
+            <li>检查模型各层的计算是否正确</li>
+            <li>定位模型错误的具体层</li>
+            <li>分析模型特征提取过程</li>
+            <li>验证ONNX模型与原始PyTorch模型的中间层输出一致性</li>
+        </ul>
+    </div>
+
+    <!-- 24. JIT模式及限制 -->
+    <div class="section" id="24">
+        <h2>24. ONNX导出使用的JIT模式及根本限制</h2>
+        <p class="question">ONNX导出过程背后使用的是 torch.jit.trace 还是 torch.jit.script？这决定了什么根本限制？</p>
+        <p>ONNX导出过程本质上使用的是 torch.jit.trace，但可以通过以下方式使用script：</p>
+        <div class="code-block">
+<span class="code-comment"># 使用script方式导出</span><br>
+scripted_model = torch.jit.script(model)  <span class="code-comment"># 符号化表示</span><br>
+torch.onnx.export(scripted_model, input_data, <span class="code-string">"model.onnx"</span>)
+        </div>
+        <p>根本限制：</p>
+        <h3>Trace模式：</h3>
+        <ul>
+            <li>只能记录特定输入下的计算路径</li>
+            <li>不支持动态控制流（如条件分支、循环）</li>
+            <li>对输入敏感，不同输入可能导致计算图不同</li>
+            <li>无法捕获运行时条件分支</li>
+        </ul>
+        <h3>Script模式：</h3>
+        <ul>
+            <li>可以处理更复杂的控制流</li>
+            <li>生成的计算图是符号化的，不依赖特定输入</li>
+            <li>支持更多类型的模型</li>
+            <li>但对代码要求更高，某些PyTorch操作可能不被支持</li>
+        </ul>
+        <p>选择策略：</p>
+        <ul>
+            <li>简单模型：优先使用trace模式</li>
+            <li>包含控制流的模型：使用script模式或静态化重写</li>
+            <li>需要支持动态维度的模型：使用script模式或dynamic_axes参数</li>
+        </ul>
+    </div>
+
+    <!-- 25. 常量折叠 -->
+    <div class="section" id="25">
+        <h2>25. 常量折叠的定义、PyTorch支持情况及影响</h2>
+        <p class="question">什么是“常量折叠”？PyTorch在导出ONNX时是否会执行？这对模型有何影响？</p>
+        <p>常量折叠是将模型中固定不变的张量（如偏置、常数）直接合并到计算图中的优化技术。PyTorch在导出ONNX时默认会执行常量折叠（通过do_constant_folding=True参数控制）。</p>
+        <p>对模型的影响：</p>
+        <ul>
+            <li>减小模型体积：合并常量，减少模型文件大小</li>
+            <li>提高推理速度：减少运行时计算量</li>
+            <li>可能引入误差：如果常量折叠导致数值精度损失</li>
+            <li>限制灵活性：某些需要动态调整的常量可能被固化</li>
+            <li>可能改变模型行为：如果模型中存在依赖运行时计算的常量</li>
+        </ul>
+        <p>最佳实践：</p>
+        <ul>
+            <li>对于大多数模型，保持do_constant_folding=True</li>
+            <li>对于需要动态调整的模型，设置do_constant_folding=False</li>
+            <li>验证导出的ONNX模型与原始PyTorch模型的输出一致性</li>
+        </ul>
+    </div>
+
+    <!-- 26. 导出子图方法 -->
+    <div class="section" id="26">
+        <h2>26. 导出大模型中某部分子图的方法</h2>
+        <p class="question">如何只导出一个大模型中的某一部分子图？</p>
+        <p>导出模型子图的两种方法：</p>
+        <div class="code-block">
+<span class="code-keyword">import</span> torch<br>
+<span class="code-keyword">import</span> torch.nn <span class="code-keyword">as</span> nn<br>
+<br>
+<span class="code-comment"># 方法1：使用PyTorch的子模块</span><br>
+sub_model = nn.Sequential(model.layer1, model.layer2)  <span class="code-comment"># 定义子模块</span><br>
+torch.onnx.export(<br>
+    sub_model,<br>
+    input_data,<br>
+    <span class="code-string">"sub_model.onnx"</span>,<br>
+    opset_version=13,<br>
+    input_names=[<span class="code-string">'input'</span>],<br>
+    output_names=[<span class="code-string">'output'</span>]<br>
+)<br>
+<br>
+<span class="code-comment"># 方法2：使用IoBinding和中间层输出</span><br>
+<span class="code-comment"># 先导出完整模型并添加中间层输出</span><br>
+<span class="code-comment"># 然后使用IoBinding只获取需要的输出</span><br>
+io = model._C._IOBinding()<br>
+io.set_input(<span class="code-string">'input'</span>, input_data)<br>
+io.set_output(<span class="code-string">'output'</span>)  <span class="code-comment"># 只指定需要的输出</span><br>
+model.run_with_iobinding(io)
+        </div>
+        <p>关键点：</p>
+        <ul>
+            <li>使用nn.Sequential包装需要的子模块</li>
+            <li>确保子模块的输入输出接口与完整模型一致</li>
+            <li>对于复杂模型，可能需要自定义中间层输出</li>
+            <li>使用IoBinding可以在推理时选择性获取输出</li>
+        </ul>
+    </div>
+
+    <!-- 27. 预处理/后处理集成 -->
+    <div class="section" id="27">
+        <h2>27. 图像预处理/后处理集成到ONNX模型中的利弊</h2>
+        <p class="question">描述将图像预处理（归一化、resize）或后处理（NMS）集成到ONNX模型中的利弊。</p>
+        <p>利：</p>
+        <ul>
+            <li>端到端优化：整个流程（预处理+模型+后处理）可被ONNX Runtime统一优化</li>
+            <li>减少数据传输：预处理和后处理在模型内部执行，减少CPU-GPU间的数据拷贝</li>
+            <li>提高推理效率：避免在外部框架中处理这些步骤带来的开销</li>
+            <li>简化部署流程：只需部署单个ONNX模型，无需管理多个组件</li>
+            <li>增强可移植性：整个流程封装在模型中，便于在不同平台部署</li>
+        </ul>
+        <p>弊：</p>
+        <ul>
+            <li>增加模型复杂度：预处理和后处理可能引入额外算子</li>
+            <li>限制灵活性：难以在运行时调整预处理/后处理参数</li>
+            <li>增加导出难度：某些预处理/后处理操作可能不被支持</li>
+            <li>可能影响精度：预处理/后处理的数值精度可能与PyTorch实现不同</li>
+            <li>增加模型体积：预处理/后处理步骤可能增加模型文件大小</li>
+        </ul>
+        <p>最佳实践：</p>
+        <ul>
+            <li>对于简单预处理（如归一化），推荐集成到ONNX模型中</li>
+            <li>对于复杂预处理（如多尺度图像增强），建议在外部处理</li>
+            <li>对于后处理（如NMS），可集成到ONNX模型中，但需注意算子支持</li>
+        </ul>
+    </div>
+
+    <!-- 28. 剪枝不需要的输出 -->
+    <div class="section" id="28">
+        <h2>28. 导出阶段剪枝模型不需要的输出</h2>
+        <p class="question">如果一个模型有多个输出，但部署时只关心一部分，能否在导出阶段剪枝掉不需要的输出？</p>
+        <p>可以，在导出阶段可以通过以下方式剪枝不需要的输出：</p>
+        <div class="code-block">
+<span class="code-keyword">import</span> torch<br>
+<span class="code-keyword">import</span> torch.nn <span class="code-keyword">as</span> nn<br>
+<br>
+<span class="code-comment"># 方法1：自定义forward函数</span><br>
+<span class="code-keyword">class</span> <span class="code-function">ModelWrapper</span>(nn.Module):<br>
+    <span class="code-keyword">def</span> <span class="code-function">__init__</span>(self, model):<br>
+        <span class="code-keyword">super</span>().__init__()<br>
+        self.model = model<br>
+<br>
+    <span class="code-keyword">def</span> <span class="code-function">forward</span>(self, x):<br>
+        outputs = self.model(x)<br>
+        <span class="code-keyword">return</span> outputs[0]  <span class="code-comment"># 只返回需要的输出</span><br>
+<br>
+<span class="code-comment"># 使用包装器导出</span><br>
+wrapped_model = ModelWrapper(original_model)<br>
+torch.onnx.export(wrapped_model, input_data, <span class="code-string">"pruned_model.onnx"</span>)<br>
+<br>
+<span class="code-comment"># 方法2：使用IoBinding选择性获取输出</span><br>
+<span class="code-comment"># 先导出完整模型，然后在推理时只获取需要的输出</span><br>
+session = onnxruntime.InferenceSession(<span class="code-string">"full_model.onnx"</span>)<br>
+output = session.run([<span class="code-string">'needed_output'</span>], {<span class="code-string">'input'</span>: input_data})
+        </div>
+        <p>关键点：</p>
+        <ul>
+            <li>通过继承nn.Module并重写forward函数，可以只返回需要的输出</li>
+            <li>使用IoBinding可以在推理时选择性获取输出</li>
+            <li>剪枝输出不会影响模型参数的导出</li>
+            <li>确保剪枝后的模型与原始模型在计算路径上一致</li>
+        </ul>
+    </div>
+
+    <!-- 29. 部署友好型编程习惯 -->
+    <div class="section" id="29">
+        <h2>29. 编写部署友好型PyTorch模型的编程习惯</h2>
+        <p class="question">在编写准备用于部署的PyTorch模型时，有哪些编程习惯可以从源头避免导出报错？</p>
+        <p>编写部署友好型PyTorch模型的编程习惯包括：</p>
+        <div class="code-block">
+<span class="code-keyword">import</span> torch<br>
+<span class="code-keyword">import</span> torch.nn <span class="code-keyword">as</span> nn<br>
+<br>
+<span class="code-comment"># 1. 使用明确的输入输出接口</span><br>
+<span class="code-keyword">class</span> <span class="code-function">DeploymentFriendlyModel</span>(nn.Module):<br>
+    <span class="code-keyword">def</span> <span class="code-function">__init__</span>(self):<br>
+        <span class="code-keyword">super</span>().__init__()<br>
+        <span class="code-comment"># 明确定义所有层</span><br>
+        self.conv = nn.Conv2d(3, 64, kernel_size=3)<br>
+        self.fc = nn.Linear(64, 10)<br>
+<br>
+    <span class="code-keyword">def</span> <span class="code-function">forward</span>(self, x):  <span class="code-comment"># 明确定义输入参数</span><br>
+        <span class="code-comment"># 明确的计算路径</span><br>
+        x = self.conv(x)<br>
+        x = torch.relu(x)<br>
+        x = x.view(x.size(0), -1)<br>
+        y = self.fc(x)<br>
+        <span class="code-keyword">return</span> y  <span class="code-comment"># 明确返回输出</span><br>
+<br>
+<span class="code-comment"># 2. 避免使用动态控制流</span><br>
+<span class="code-comment"># 不推荐：</span><br>
+<span class="code-keyword">if</span> condition(x):<br>
+    y = layer1(x)<br>
+<span class="code-keyword">else</span>:<br>
+    y = layer2(x)<br>
+<br>
+<span class="code-comment"># 推荐：</span><br>
+mask = (condition(x)).float()<br>
+y = mask * layer1(x) + (1 - mask) * layer2(x)<br>
+<br>
+<span class="code-comment"># 3. 使用明确的张量操作</span><br>
+<span class="code-comment"># 不推荐：</span><br>
+output = []<br>
+<span class="code-keyword">for</span> i <span class="code-keyword">in</span> range(len(inputs)):<br>
+    output.append(layer(inputs[i]))<br>
+<br>
+<span class="code-comment"># 推荐：</span><br>
+output = torch.stack([layer(input) <span class="code-keyword">for</span> input <span class="code-keyword">in</span> inputs])<br>
+<br>
+<span class="code-comment"># 4. 避免使用不支持的算子</span><br>
+<span class="code-comment"># 不推荐：</span><br>
+output = torch._C._nn.max_pool2d(input)<br>
+<br>
+<span class="code-comment"># 推荐：</span><br>
+output = nn.functional.max_pool2d(input, kernel_size=2)
+        </div>
+        <p>关键点：</p>
+        <ul>
+            <li>使用明确的输入输出接口</li>
+            <li>避免使用动态控制流（如if/for）</li>
+            <li>使用PyTorch官方提供的算子</li>
+            <li>避免使用不支持的算子（如某些自定义算子）</li>
+            <li>确保模型在评估模式下运行</li>
+            <li>使用确定性随机操作（如设置随机种子）</li>
+            <li>避免使用不明确的张量操作</li>
+        </ul>
+    </div>
+
+    <!-- 30. 版本兼容性管理 -->
+    <div class="section" id="30">
+        <h2>30. 管理PyTorch、ONNX、推理引擎的版本兼容性</h2>
+        <p class="question">你如何管理PyTorch, ONNX, 推理引擎等不同组件版本的兼容性？</p>
+        <p>管理版本兼容性的策略：</p>
+        <div class="code-block">
+<span class="code-comment"># 1. 使用虚拟环境隔离不同版本</span><br>
+<span class="code-comment"># conda create -n deployment_env python=3.8</span><br>
+<span class="code-comment"># conda install pytorch==1.12.1 onnx==1.12.0 onnxruntime==1.14.0</span><br>
+<br>
+<span class="code-comment"># 2. 指定明确的opset版本</span><br>
+opset_version = 13  <span class="code-comment"># 与目标推理引擎兼容</span><br>
+torch.onnx.export(model, input_data, <span class="code-string">"model.onnx"</span>, opset_version=opset_version)<br>
+<br>
+<span class="code-comment"># 3. 使用版本转换工具</span><br>
+<span class="code-keyword">import</span> onnx<br>
+<span class="code-keyword">from</span> onnx <span class="code-keyword">import</span> version_converter<br>
+<br>
+<span class="code-comment"># 加载模型</span><br>
+model = onnx.load(<span class="code-string">"model.onnx"</span>)<br>
+<br>
+<span class="code-comment"># 转换为旧版opset</span><br>
+converted_model = version_converter.convert_version(model, 11)<br>
+<br>
+<span class="code-comment"># 保存转换后的模型</span><br>
+onnx.save(converted_model, <span class="code-string">"model_v11.onnx"</span>)<br>
+<br>
+<span class="code-comment"># 4. 兼容性测试代码</span><br>
+<span class="code-keyword">def</span> <span class="code-function">test_compatibility</span>(pytorch_model, onnx_model_path, test_input):<br>
+    <span class="code-comment"># PyTorch输出</span><br>
+    with torch.no_grad():<br>
+        pt_output = pytorch_model(test_input)<br>
+    <br>
+    <span class="code-comment"># ONNX输出</span><br>
+    session = onnxruntime.InferenceSession(onnx_model_path)<br>
+    onnx_output = session.run(None, {<span class="code-string">'input'</span>: test_input.numpy()})<br>
+    <br>
+    <span class="code-comment"># 验证输出一致性</span><br>
+    torch.allclose(torch.tensor(onnx_output[0]), pt_output, atol=1e-5)
+        </div>
+        <p>关键点：</p>
+        <ul>
+            <li>使用虚拟环境隔离不同版本</li>
+            <li>指定明确的opset版本</li>
+            <li>使用版本转换工具处理不兼容情况</li>
+            <li>保持PyTorch和ONNX版本的兼容性</li>
+            <li>测试不同推理引擎的版本兼容性</li>
+            <li>记录所有组件的版本信息</li>
+        </ul>
+    </div>
+</body>
+</html>
